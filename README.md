@@ -3,9 +3,11 @@
 A mirror repository in the sense of mithro/apt-repo-action's
 [docs/packaging.md](https://github.com/mithro/apt-repo-action/blob/main/docs/packaging.md)
 ("Mirrors"). It keeps an exact copy of [sshpiper](https://github.com/tg123/sshpiper),
-the SSH reverse proxy that routes by user name, and builds it unchanged as the
-Debian package `sshpiper`, to be published as a signed apt repository at
-<https://fpgas.online/sshpiper/>.
+the SSH reverse proxy that routes by user name, and builds it as the Debian
+package `sshpiper`, to be published as a signed apt repository at
+<https://fpgas.online/sshpiper/>. sshpiper's own code is built unchanged; one
+fix of ours is applied to the crypto module it links
+([What the packaging changes](#what-the-packaging-changes)).
 
 fpgas.online uses it on a site's gateway, so that
 `ssh <board>@<board>.<site>` reaches the right board over IPv4
@@ -60,7 +62,10 @@ upstream's release does (its `.goreleaser.yaml`):
 - `sshpiperd` from `cmd/sshpiperd`, which is a Go module of its own: its
   `go.mod` replaces `golang.org/x/crypto` with upstream's patched
   `github.com/tg123/sshpiper.crypto`, so that fork is fetched by Go at the
-  version upstream pinned (upstream no longer uses git submodules);
+  version upstream pinned (upstream no longer uses git submodules). Our
+  patches to that module are applied to a copy of it, and `sshpiperd` is
+  built in a Go workspace of `cmd/sshpiperd` and the copy; the workspace file
+  is outside the checkout, which stays exactly upstream's;
 - each plugin from `./plugin/<name>` with the build tag `full`;
 - everything with `CGO_ENABLED=0 -trimpath -ldflags "-s -w"`, and the version
   in `main.mainver`.
@@ -71,9 +76,9 @@ for Go programs: no `debian/` directory). Every packaged file carries the
 packaging commit's time, so building the same two commits again gives the
 same package, byte for byte.
 
-Upstream's own test suite is not run here: the code is upstream's, unchanged,
-and upstream's CI tests each commit. What this repository tests is what it
-adds, the package (the install test below).
+Upstream's own test suite is not run here: upstream's CI tests each commit.
+What this repository tests is what it adds, the package and our patch (the
+install test below).
 
 ## How it runs
 
@@ -135,9 +140,36 @@ Either a new upstream commit or a new packaging commit raises it. No dates.
 
 ## What the packaging changes
 
-Nothing: the package is upstream's code as it is.
+Nothing in sshpiper's own repository: `master` is built as it is. One patch
+is applied to the Go module `sshpiperd` links for SSH, upstream's
+`github.com/tg123/sshpiper.crypto` (a patched `golang.org/x/crypto`, pinned
+in `cmd/sshpiperd/go.mod`). That module is not in this repository, so the
+patch is a file here, applied by `packaging/build.sh` on every build; a patch
+that no longer applies exactly fails the build.
 
-When a change of ours is needed, it goes on a patch branch, never into a
+| patch | what |
+|---|---|
+| `packaging/patches/sshpiper.crypto/0001-close-onward-connection-when-login-fails.patch` | sshpiperd makes a new connection to the upstream server for every authentication attempt of a client, and never closed one whose authentication failed. Every wrong password through the proxy left an unauthenticated connection at the upstream sshd until that sshd's `LoginGraceTime` (120 s), each holding one of its `MaxStartups` slots: a dozen wrong passwords shut real logins out. The patch closes the upstream connection when its authentication fails, and when the client goes away, or never proves it holds an offered public key, after a callback had already authenticated upstream. A client's retries in one connection are unaffected: each attempt gets a new upstream connection, as before. |
+
+The patch file's header has the details and how it is tested: the install
+test sends 12 wrong passwords through `sshpiperd` and then requires that no
+connection is left open at the backend sshd, that a wrong password followed by
+the right one in one connection logs in, and that one connection gets its
+three attempts.
+
+Every published version is a patched one, and the version says so in its
+`+fpgasonline.<X.Y.postN>` half: a change to a patch is a commit to
+`packaging`, which raises it. `/usr/share/doc/sshpiper/copyright` lists the
+patches a package was built with. Nothing here is offered to or filed with
+upstream.
+
+Related, for whoever deploys it: every login through sshpiperd reaches the
+upstream sshd from sshpiperd's address. OpenSSH 9.8 and later penalise an
+address after failed logins (`PerSourcePenalties`), so an upstream sshd needs
+the proxy's address in its `PerSourcePenaltyExemptList`, or a few wrong
+passwords by anyone shut everyone's proxied logins out for a while.
+
+A change of ours to sshpiper's own code goes on a patch branch, never into a
 mirrored branch (docs/packaging.md, "Our own patches on a mirror"): our
 commits on `patches/<topic>`, on top of a commit of `master`, pinned in
 `.github/apt-packaging.toml` as `[[mirror.patches]]`, and applied to `src/` by
