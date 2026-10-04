@@ -1,0 +1,62 @@
+# The sshpiper Debian package (packaging/nfpm.sh runs nfpm with this).
+# ARCH is the Debian architecture, VERSION the shared deb-version's, and
+# the contents are relative to dist/<arch>/, which packaging/build.sh wrote
+# and nfpm is run in.
+#
+# Only the programs: the systemd unit and the configuration belong to
+# whatever deploys it (for fpgas.online, the infra repository's ssh proxy
+# role). Statically linked Go, so no dependencies.
+name: sshpiper
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+# Keep the version exactly as given: nfpm would rewrite it as semver.
+version_schema: none
+section: net
+priority: optional
+maintainer: Tim 'mithro' Ansell <me@mith.ro>
+homepage: https://github.com/tg123/sshpiper
+vendor: fpgas.online
+license: MIT
+description: |
+  reverse proxy for SSH that routes by user name
+  sshpiperd accepts SSH connections and pipes each one to an upstream SSH
+  server chosen by a plugin, from the user name and the credentials the
+  client offers. The client and the upstream still authenticate each other
+  through it.
+  .
+  This package holds the daemon (/usr/sbin/sshpiperd) and upstream's
+  plugins as separate programs under /usr/lib/sshpiper/plugins: failtoban,
+  fixed, lua, username-router, workingdir and yaml. It installs no service
+  and no configuration.
+deb:
+  compression: xz
+  fields:
+    Vcs-Git: https://github.com/fpgas-online/sshpiper.git -b packaging
+    Vcs-Browser: https://github.com/fpgas-online/sshpiper/tree/packaging
+contents:
+  - src: ./sshpiperd
+    dst: /usr/sbin/sshpiperd
+    file_info: {mode: 0755}
+  # One entry per plugin, so a plugin that wasn't built fails the packaging.
+  - src: ./plugins/failtoban
+    dst: /usr/lib/sshpiper/plugins/failtoban
+    file_info: {mode: 0755}
+  - src: ./plugins/fixed
+    dst: /usr/lib/sshpiper/plugins/fixed
+    file_info: {mode: 0755}
+  - src: ./plugins/lua
+    dst: /usr/lib/sshpiper/plugins/lua
+    file_info: {mode: 0755}
+  - src: ./plugins/username-router
+    dst: /usr/lib/sshpiper/plugins/username-router
+    file_info: {mode: 0755}
+  - src: ./plugins/workingdir
+    dst: /usr/lib/sshpiper/plugins/workingdir
+    file_info: {mode: 0755}
+  - src: ./plugins/yaml
+    dst: /usr/lib/sshpiper/plugins/yaml
+    file_info: {mode: 0755}
+  - src: ./copyright
+    dst: /usr/share/doc/sshpiper/copyright
+    file_info: {mode: 0644}
