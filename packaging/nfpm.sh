@@ -2,7 +2,7 @@
 # Package what packaging/build.sh built (dist/<arch>/) for one suite, with
 # nfpm and the repository's nfpm.yaml:
 #
-#   ARCH=amd64 sh packaging/nfpm.sh <suite> <version>
+#   ARCH=amd64 SOURCE_DATE_EPOCH=<seconds> sh packaging/nfpm.sh <suite> <version>
 #
 # from the root of the packaging checkout. Writes
 # built-debs/<suite>/sshpiper_<version>_<arch>.deb. The binaries are static,
@@ -16,6 +16,11 @@ set -eu
 suite=${1:?usage: nfpm.sh <suite> <version>}
 version=${2:?usage: nfpm.sh <suite> <version>}
 : "${ARCH:?set ARCH, the Debian architecture of dist/<arch> (amd64, arm64)}"
+# The time on every file in the package, so a later build of the same commit
+# makes the same package: the packaging commit's committer time
+# (git log -1 --format=%ct).
+: "${SOURCE_DATE_EPOCH:?set SOURCE_DATE_EPOCH, the committer time of the packaging commit}"
+export SOURCE_DATE_EPOCH
 
 NFPM_VERSION=2.47.0
 host=$(dpkg --print-architecture)

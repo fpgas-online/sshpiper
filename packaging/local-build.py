@@ -74,6 +74,8 @@ def main() -> None:
     checkout(args.mirror, decl["mirror"]["build"], src)
     checkout(ACTION, "main", action)
     commit = run("git", "rev-parse", "HEAD", cwd=src, capture=True)
+    # The packaging commit's time, for every packaged file (packaging/nfpm.sh).
+    epoch = run("git", "log", "-1", "--format=%ct", capture=True)
 
     def version(suite: str) -> str:
         return run("python3", str(action / "scripts/deb-version.py"), "--suite", suite,
@@ -92,7 +94,8 @@ def main() -> None:
         (ROOT / d).mkdir(parents=True, exist_ok=True)
     for arch in args.arch:
         steps = [f"GOARCH={GOARCH[arch]} BINARY_VERSION='{binary}' sh packaging/build.sh tmp/src dist/{arch}"]
-        steps += [f"ARCH={arch} sh packaging/nfpm.sh {suite} '{versions[suite]}'" for suite in args.suites]
+        steps += [f"ARCH={arch} SOURCE_DATE_EPOCH={epoch} sh packaging/nfpm.sh {suite} '{versions[suite]}'"
+                  for suite in args.suites]
         # As this user, so nothing under the checkout ends up owned by root,
         # and git accepts tmp/src as the user's own.
         run("docker", "run", "--rm", "--user", f"{os.getuid()}:{os.getgid()}",

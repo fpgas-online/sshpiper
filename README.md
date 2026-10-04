@@ -67,7 +67,13 @@ upstream's release does (its `.goreleaser.yaml`):
 
 `packaging/nfpm.sh` then packages the result once per suite with
 [nfpm](https://nfpm.goreleaser.com/) and `nfpm.yaml` (the shared convention
-for Go programs: no `debian/` directory).
+for Go programs: no `debian/` directory). Every packaged file carries the
+packaging commit's time, so building the same two commits again gives the
+same package, byte for byte.
+
+Upstream's own test suite is not run here: the code is upstream's, unchanged,
+and upstream's CI tests each commit. What this repository tests is what it
+adds, the package (the install test below).
 
 ## How it runs
 

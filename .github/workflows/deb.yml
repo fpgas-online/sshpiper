@@ -118,6 +118,10 @@ jobs:
           set -euo pipefail
           commit=$(git -C src rev-parse HEAD)
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          # The packaging commit's time on every packaged file, so a later
+          # build of the same commits makes the same packages.
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          export SOURCE_DATE_EPOCH
           sh packaging/build.sh src "dist/$ARCH"
           for suite in $SUITES; do
             var="V_$suite"
