@@ -1,0 +1,172 @@
+#!/bin/sh
+# Install test (mithro/apt-repo-action docs/packaging.md, "Builds"): run as
+# root in a clean debian:<suite> container after the built sshpiper package
+# was installed there with apt.
+#
+# 1. The package: its files, no service and no configuration, the version
+#    and upstream commit sshpiperd reports, every plugin runs.
+# 2. A real login through it: an OpenSSH client connects to sshpiperd, which
+#    runs the `fixed` plugin with an explicit --server-key and
+#    --drop-hostkeys-message (how fpgas.online's gateway runs it), and is
+#    piped to a throwaway sshd in the same container. The client must have
+#    been shown sshpiperd's host key, must land in a session of that sshd,
+#    and must not be sent the sshd's own host keys.
+#
+# EXPECT_VERSION (the version built into sshpiperd) and EXPECT_COMMIT (the
+# upstream commit) are checked when set.
+#
+# sshpiper is statically linked and depends on nothing, so the OpenSSH
+# packages this test installs can't change anything it runs with.
+set -eu
+export DEBIAN_FRONTEND=noninteractive
+
+PLUGIN_DIR=/usr/lib/sshpiper/plugins
+PLUGINS="failtoban fixed lua username-router workingdir yaml"
+BACKEND_PORT=2201
+PROXY_PORT=2202
+
+fail() {
+  echo "install-test: FAIL: $*" >&2
+  exit 1
+}
+
+# In the container, which is thrown away with everything in it.
+d=$(mktemp -d)
+
+echo "== the package"
+dpkg-query -W -f 'sshpiper ${Version} ${Architecture} ${Status}\n' sshpiper
+dpkg -L sshpiper
+if dpkg -L sshpiper | grep -E '^/etc(/|$)|systemd|/init\.d/'; then
+  fail "the package ships configuration or a service (the lines above); it must not"
+fi
+[ "$(command -v sshpiperd)" = /usr/sbin/sshpiperd ] || fail "sshpiperd is not /usr/sbin/sshpiperd"
+[ -s /usr/share/doc/sshpiper/copyright ] || fail "no /usr/share/doc/sshpiper/copyright"
+
+echo "== sshpiperd --version"
+reported=$(sshpiperd --version)
+echo "$reported"
+if [ -n "${EXPECT_VERSION:-}" ]; then
+  case "$reported" in
+    *"version $EXPECT_VERSION, "*) ;;
+    *) fail "sshpiperd --version does not report $EXPECT_VERSION" ;;
+  esac
+fi
+if [ -n "${EXPECT_COMMIT:-}" ]; then
+  short=$(printf %.9s "$EXPECT_COMMIT")
+  case "$reported" in
+    *", $short, "*) ;;
+    *) fail "sshpiperd --version does not report upstream commit $short" ;;
+  esac
+  grep -q "$EXPECT_COMMIT" /usr/share/doc/sshpiper/copyright ||
+    fail "/usr/share/doc/sshpiper/copyright does not name upstream commit $EXPECT_COMMIT"
+fi
+
+echo "== sshpiperd --help"
+sshpiperd --help > "$d/sshpiperd-help.txt"
+for flag in --server-key --drop-hostkeys-message; do
+  grep -q -- "$flag" "$d/sshpiperd-help.txt" || fail "sshpiperd --help does not list $flag"
+done
+sed -n '1,8p' "$d/sshpiperd-help.txt"
+
+echo "== plugins in $PLUGIN_DIR"
+ls -l "$PLUGIN_DIR"
+got=$(ls "$PLUGIN_DIR" | tr '\n' ' ' | sed 's/ $//')
+[ "$got" = "$PLUGINS" ] || fail "plugins are \"$got\", not \"$PLUGINS\""
+# A plugin has no --help or --version (upstream hides them), and started
+# without a flag it doesn't know it serves sshpiperd on its standard input
+# and output. So each is started with --help, which upstream's plugin library
+# turns down in its own words: the program runs here, and is an sshpiper
+# plugin.
+for p in $PLUGINS; do
+  said=$("$PLUGIN_DIR/$p" --help 2>&1 < /dev/null) || fail "plugin $p exited $?: $said"
+  case "$said" in
+    *"cannot start plugin: flag: help requested"*) echo "$p: starts" ;;
+    *) fail "plugin $p didn't answer as an sshpiper plugin: $said" ;;
+  esac
+done
+
+echo "== a login through sshpiperd (fixed plugin) to a throwaway sshd"
+apt-get install -y --no-install-recommends openssh-server openssh-client sshpass > "$d/apt-tools.log" 2>&1 ||
+  { cat "$d/apt-tools.log" >&2; fail "couldn't install the OpenSSH tools the test uses"; }
+ssh -V
+
+password=install-test-$$
+useradd --create-home --shell /bin/sh backenduser
+echo "backenduser:$password" | chpasswd
+# Both Ed25519, as fpgas.online's fleet key is; different keys, so the client
+# can only have verified the one sshpiperd was given.
+ssh-keygen -q -t ed25519 -N '' -C backend -f "$d/backend_host_key"
+ssh-keygen -q -t ed25519 -N '' -C proxy -f "$d/proxy_host_key"
+
+mkdir -p /run/sshd
+/usr/sbin/sshd -f /dev/null -E "$d/sshd.log" \
+  -o ListenAddress=127.0.0.1 -o Port=$BACKEND_PORT -o HostKey="$d/backend_host_key" \
+  -o PidFile="$d/sshd.pid" -o PasswordAuthentication=yes -o UsePAM=no
+
+sshpiperd --address 127.0.0.1 --port $PROXY_PORT \
+  --server-key "$d/proxy_host_key" --server-key-generate-mode disable \
+  --drop-hostkeys-message \
+  "$PLUGIN_DIR/fixed" --target 127.0.0.1:$BACKEND_PORT > "$d/sshpiperd.log" 2>&1 &
+piper=$!
+
+logs() {
+  echo "--- sshpiperd log"; cat "$d/sshpiperd.log"
+  echo "--- sshd log"; cat "$d/sshd.log"
+  if [ -f "$d/ssh.log" ]; then echo "--- ssh client log"; cat "$d/ssh.log"; fi
+}
+
+# Wait for sshpiperd to answer, and read the host key it presents.
+presented=
+for _ in $(seq 1 50); do
+  kill -0 "$piper" 2> /dev/null || { logs >&2; fail "sshpiperd exited"; }
+  # Newer ssh-keyscans also print the server's banner, as a # comment.
+  if ssh-keyscan -T 2 -t ed25519 -p $PROXY_PORT 127.0.0.1 > "$d/keyscan.out" 2> "$d/keyscan.err"; then
+    presented=$(grep -v '^#' "$d/keyscan.out" || true)
+    [ -z "$presented" ] || break
+  fi
+  sleep 0.2
+done
+[ -n "$presented" ] || { cat "$d/keyscan.err" >&2; logs >&2; fail "sshpiperd never answered on port $PROXY_PORT"; }
+want_key=$(cut -d' ' -f1,2 "$d/proxy_host_key.pub")
+[ "$(echo "$presented" | cut -d' ' -f2,3)" = "$want_key" ] ||
+  { logs >&2; fail "sshpiperd presents \"$presented\", not the --server-key $want_key"; }
+echo "sshpiperd presents its --server-key: $want_key"
+
+# Only sshpiperd's key is known, and checking is strict: a login that
+# succeeds verified that key. UpdateHostKeys is on, so the client would take
+# up the hostkeys-00@openssh.com message if the sshd's reached it.
+echo "[127.0.0.1]:$PROXY_PORT $want_key" > "$d/known_hosts"
+cp "$d/known_hosts" "$d/known_hosts.before"
+landed=$(sshpass -p "$password" ssh -v -E "$d/ssh.log" -p $PROXY_PORT \
+  -o UserKnownHostsFile="$d/known_hosts" -o GlobalKnownHostsFile=/dev/null \
+  -o StrictHostKeyChecking=yes -o UpdateHostKeys=yes \
+  -o PreferredAuthentications=password -o PubkeyAuthentication=no \
+  backenduser@127.0.0.1 'echo "user=$(id -un) connection=$SSH_CONNECTION"') ||
+  { logs >&2; fail "the login through sshpiperd failed"; }
+echo "the client landed on: $landed"
+
+# SSH_CONNECTION is "<client ip> <client port> <server ip> <server port>" as
+# the sshd that ran the session saw it: the backend's port, though the client
+# dialled sshpiperd's.
+case "$landed" in
+  "user=backenduser connection=127.0.0.1 "*" 127.0.0.1 $BACKEND_PORT") ;;
+  *) logs >&2; fail "the session is not backenduser's on the backend sshd (port $BACKEND_PORT)" ;;
+esac
+grep -q "Accepted password for backenduser from 127.0.0.1" "$d/sshd.log" ||
+  { logs >&2; fail "the backend sshd logged no accepted login"; }
+grep -q "Authenticated to 127.0.0.1 (\[127.0.0.1\]:$PROXY_PORT)" "$d/ssh.log" ||
+  { logs >&2; fail "the client did not authenticate to sshpiperd's port $PROXY_PORT"; }
+
+# --drop-hostkeys-message: the sshd's hostkeys-00@openssh.com must not reach
+# the client, which would otherwise learn (or warn about) the backend's keys.
+if grep -q "hostkeys-00@openssh.com" "$d/ssh.log"; then
+  logs >&2
+  fail "the client was sent hostkeys-00@openssh.com despite --drop-hostkeys-message"
+fi
+cmp -s "$d/known_hosts" "$d/known_hosts.before" ||
+  { logs >&2; fail "the client's known_hosts changed: it learnt a key through sshpiperd"; }
+echo "no hostkeys-00@openssh.com reached the client; its known_hosts is unchanged"
+
+kill "$piper"
+kill "$(cat "$d/sshd.pid")"
+echo "install-test: OK: sshpiper $(dpkg-query -W -f '${Version}' sshpiper) installs, and a login through sshpiperd + fixed landed on the backend sshd"
