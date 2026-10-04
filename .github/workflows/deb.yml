@@ -1,0 +1,203 @@
+name: Debian packages
+
+# Builds the sshpiper package from the mirrored upstream branch (master, an
+# exact copy of github.com/tg123/sshpiper's) with this branch's packaging,
+# for each suite and architecture, and publishes one signed flat apt
+# repository per suite to this repository's GitHub Pages through
+# mithro/apt-repo-action:
+#
+#   deb [signed-by=/etc/apt/keyrings/sshpiper.gpg] https://fpgas.online/sshpiper/<suite>/ ./
+#
+# Runs on a push to packaging, and when "Sync upstream" has moved master (it
+# starts this workflow, since its pushes can't). Pull requests build
+# everything and publish nothing. Publishing happens only from the default
+# branch: while that is not `packaging` (this repository is a GitHub fork,
+# whose default branch was upstream's master), every run builds and tests
+# and the publish job is skipped.
+#
+# sshpiper is statically linked Go, packaged with nfpm (docs/packaging.md,
+# "The shared actions"): the binaries are built once per architecture and
+# packaged once per suite, since ~deb<R> gives each suite its own version.
+on:
+  push:
+    branches: [packaging]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deb-${{ github.ref }}
+  # A newer push to a pull request cancels the older build. On the default
+  # branch a running publish is never cancelled: the newest run waits for it,
+  # and replaces any older one still waiting.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  UPSTREAM_BRANCH: master
+
+jobs:
+  # One job per architecture. Go cross-compiles, but each architecture's
+  # runner is the one that can run its install test natively.
+  build-deb:
+    name: build-deb (${{ join(matrix.suites, ' ') }} ${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {arch: amd64, runner: ubuntu-24.04, platform: linux/amd64,
+             suites: [bookworm, trixie, forky, sid]}
+          - {arch: arm64, runner: ubuntu-24.04-arm, platform: linux/arm64,
+             suites: [bookworm, trixie, forky, sid]}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # the packaging half of the version comes from git describe
+
+      - name: Check out upstream
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.UPSTREAM_BRANCH }}
+          path: src
+          fetch-depth: 0 # the upstream half of the version needs its tags
+          persist-credentials: false
+
+      # The Go that upstream's go.mod names; packaging/build.sh refuses to
+      # fetch another toolchain.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: src/go.mod
+          cache-dependency-path: |
+            src/go.sum
+            src/cmd/sshpiperd/go.sum
+
+      # The shared scripts/deb-version.py, mirror form: upstream's describe
+      # (src, [mirror] tags) + fpgasonline + packaging's own. One step per
+      # suite: the shared action versions one suite at a time.
+      - name: Version (bookworm)
+        id: v-bookworm
+        uses: mithro/apt-repo-action/deb-version@main
+        with:
+          suite: bookworm
+          version-args: --owner-tag fpgasonline --upstream-dir src
+      - name: Version (trixie)
+        id: v-trixie
+        uses: mithro/apt-repo-action/deb-version@main
+        with:
+          suite: trixie
+          version-args: --owner-tag fpgasonline --upstream-dir src
+      - name: Version (forky)
+        id: v-forky
+        uses: mithro/apt-repo-action/deb-version@main
+        with:
+          suite: forky
+          version-args: --owner-tag fpgasonline --upstream-dir src
+      - name: Version (sid)
+        id: v-sid
+        uses: mithro/apt-repo-action/deb-version@main
+        with:
+          suite: sid
+          version-args: --owner-tag fpgasonline --upstream-dir src
+
+      - name: Build
+        id: build
+        env:
+          ARCH: ${{ matrix.arch }}
+          GOARCH: ${{ matrix.arch }}
+          SUITES: ${{ join(matrix.suites, ' ') }}
+          # What sshpiperd --version reports: the suite-independent version, sid's.
+          BINARY_VERSION: ${{ steps.v-sid.outputs.version }}
+          V_bookworm: ${{ steps.v-bookworm.outputs.version }}
+          V_trixie: ${{ steps.v-trixie.outputs.version }}
+          V_forky: ${{ steps.v-forky.outputs.version }}
+          V_sid: ${{ steps.v-sid.outputs.version }}
+        run: |
+          set -euo pipefail
+          commit=$(git -C src rev-parse HEAD)
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          sh packaging/build.sh src "dist/$ARCH"
+          for suite in $SUITES; do
+            var="V_$suite"
+            sh packaging/nfpm.sh "$suite" "${!var}"
+          done
+          {
+            echo "### sshpiper, $ARCH"
+            echo
+            echo "Built from upstream \`$UPSTREAM_BRANCH\` at \`$commit\` ($(git -C src describe --tags --long --match 'v[0-9]*'))."
+            echo
+            for suite in $SUITES; do
+              var="V_$suite"
+              echo "- $suite: \`sshpiper_${!var}_$ARCH.deb\`"
+            done
+            echo
+            echo '```'
+            dpkg-deb -c "built-debs/sid/sshpiper_${V_sid}_$ARCH.deb"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install test
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          SUITES: ${{ join(matrix.suites, ' ') }}
+          EXPECT_VERSION: ${{ steps.v-sid.outputs.version }}
+          EXPECT_COMMIT: ${{ steps.build.outputs.commit }}
+        run: |
+          set -euo pipefail
+          for suite in $SUITES; do
+            echo "::group::$suite ($PLATFORM)"
+            docker run --rm --platform "$PLATFORM" \
+              -v "$PWD/built-debs/$suite:/debs:ro" \
+              -v "$PWD/packaging/install-test.sh:/install-test.sh:ro" \
+              -e EXPECT_VERSION -e EXPECT_COMMIT \
+              "debian:$suite" sh -ec '
+                apt-get update
+                apt-get install -y /debs/*.deb
+                sh /install-test.sh'
+            echo "::endgroup::"
+          done
+
+      - name: Upload (bookworm)
+        uses: actions/upload-artifact@v7
+        with:
+          name: debs-bookworm-${{ matrix.arch }}
+          path: built-debs/bookworm/*.deb
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload (trixie)
+        uses: actions/upload-artifact@v7
+        with:
+          name: debs-trixie-${{ matrix.arch }}
+          path: built-debs/trixie/*.deb
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload (forky)
+        uses: actions/upload-artifact@v7
+        with:
+          name: debs-forky-${{ matrix.arch }}
+          path: built-debs/forky/*.deb
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload (sid)
+        uses: actions/upload-artifact@v7
+        with:
+          name: debs-sid-${{ matrix.arch }}
+          path: built-debs/sid/*.deb
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-apt:
+    if: github.event_name != 'pull_request' && github.ref_name == github.event.repository.default_branch
+    needs: build-deb
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    uses: mithro/apt-repo-action/.github/workflows/publish-apt.yml@main
+    with:
+      suites: "bookworm trixie forky sid"
+      description: "sshpiper (github.com/tg123/sshpiper), the SSH reverse proxy that routes by user name"
+    secrets:
+      gpg-private-key: ${{ secrets.APT_GPG_PRIVATE_KEY }}
