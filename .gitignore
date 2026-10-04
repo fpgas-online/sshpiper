@@ -1,0 +1,8 @@
+# The upstream checkout the build is made from, and what the build writes.
+/src/
+/dist/
+/built-debs/
+/tmp/
+# Mirrors commit no changelog (mithro/apt-repo-action docs/packaging.md,
+# "The changelog"); this package is built with nfpm and has no debian/ at all.
+debian/changelog
