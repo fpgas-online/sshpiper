@@ -1,0 +1,32 @@
+name: Sync upstream
+
+# Copies every branch and tag of github.com/tg123/sshpiper here exactly and,
+# when master moved, starts "Debian packages" to build and publish it: the
+# shared mirror sync (mithro/apt-repo-action, docs/packaging.md "Mirrors"),
+# driven by .github/apt-packaging.toml. It never touches `packaging` or its
+# tags, and never deletes anything.
+#
+# It runs only once `packaging` is the default branch: GitHub runs scheduled
+# workflows from the default branch alone, and the sync reads the declaration
+# from it.
+on:
+  schedule:
+    - cron: "0 6 * * *" # daily 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write # push the copies
+  actions: write # start deb.yml
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    uses: mithro/apt-repo-action/.github/workflows/sync-mirror.yml@main
+    secrets:
+      # upstream's branches carry .github/workflows/ files, which the
+      # workflow's own token may not push: a token with Contents and
+      # Workflows write. Without the secret the sync fails at that push.
+      token: ${{ secrets.MIRROR_TOKEN }}
