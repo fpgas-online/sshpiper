@@ -1,0 +1,99 @@
+Description: close the onward connection when a login through the pipe fails
+ sshpiperd makes a new connection to the upstream (onward) SSH server for
+ every authentication attempt of a downstream client, and authenticates to
+ it with what the client gave. When that failed, the connection was never
+ closed:
+ .
+  - authUpstream returned on a failed clientAuthenticateReturnAllowed
+    without closing the connection it had just made. Each wrong password
+    relayed to the upstream sshd therefore left one unauthenticated
+    connection there until that sshd's own LoginGraceTime (120 s by
+    default), holding one of its MaxStartups slots (10:30:100 by default).
+    A dozen wrong passwords through the proxy shut real logins out of the
+    upstream ("drop connection #11 ... Maxstartups" in its log).
+  - NewSSHPiperConn returned an error when the downstream client did not
+    finish authenticating (it went away, or offered a public key that a
+    plugin maps to an upstream private key, and never signed for it) without
+    closing an upstream connection a callback had already authenticated.
+    That one stayed open, authenticated, with nothing piped to it.
+  - a second successful callback on one downstream connection replaced
+    p.upstream without closing the first.
+ .
+ The patch closes the upstream connection in those three places and nowhere
+ else. It is safe for retries: a failed upstream connection is local to
+ authUpstream and is never reused, since the next attempt of the same
+ downstream client calls its callback again, which dials a new one. So the
+ client keeps its normal password attempts within one connection. A
+ connection that authenticated and is then piped is untouched: it is only
+ closed when no pipe will ever be made from it.
+ .
+ Not changed: how keys are relayed, and sshpiperd's own handling of its
+ login grace time.
+ .
+ Tested by packaging/install-test.sh in a clean container of each suite:
+ 12 wrong passwords through sshpiperd to a throwaway sshd, each in its own
+ connection, then no established TCP connection may remain at that sshd's
+ port, and all 12 must have been refused by the sshd itself (none dropped
+ for MaxStartups); then one connection with a wrong password followed by
+ the right one must log in, one connection must get three attempts, and a
+ correct login must still work afterwards. Without the patch the test fails
+ with 11 connections left open and the twelfth dropped by MaxStartups.
+ .
+ The module's own tests (go test ./ssh -run Piper) pass with the patch except
+ TestPiperUsernameNotChangedWithinSession, whose fake upstream server now
+ reports "cannot start upstream [ssh: no auth passed yet, access denied]":
+ its upstreams refuse the relayed credentials, and the test helper counts an
+ upstream that sees its connection closed during authentication as an error.
+ Before the patch those fake upstreams simply never returned, which is the
+ leak. The test's assertions about the client and the piper still hold. The
+ test file is not changed here: it is not part of what is built.
+Author: fpgas.online packaging (https://github.com/fpgas-online/sshpiper)
+Origin: vendor
+Forwarded: no (kept in fpgas-online/sshpiper only)
+Applies-To: github.com/tg123/sshpiper.crypto v0.57.0-sshpiper-20260929
+ (the golang.org/x/crypto that cmd/sshpiperd/go.mod replaces), file
+ ssh/sshpiper.go
+---
+--- a/ssh/sshpiper.go
++++ b/ssh/sshpiper.go
+@@ -332,6 +332,12 @@
+ 	}
+ 
+ 	if err := u.clientAuthenticateReturnAllowed(config); err != nil {
++		// This upstream connection is never used again: a retry by the
++		// downstream client gets a new one from its callback. Left open,
++		// it stays unauthenticated at the upstream server until that
++		// server's own login timeout.
++		u.transport.Close()
++
+ 		if p.config.UpstreamAuthFailureCallback != nil {
+ 			p.config.UpstreamAuthFailureCallback(downstream, method, err, p.challengeCtx)
+ 		}
+@@ -342,6 +348,12 @@
+ 	}
+ 
+ 	u.user = config.User
++	if p.upstream != nil {
++		// An earlier callback of this downstream connection already
++		// authenticated to an upstream (a public key that was offered and
++		// accepted, but not yet signed for). Only one is ever piped.
++		p.upstream.transport.Close()
++	}
+ 	p.upstream = u
+ 
+ 	return nil
+@@ -487,6 +499,14 @@
+ 	}
+ 
+ 	if err := p.mapToUpstreamViaDownstreamAuth(); err != nil {
++		if p.upstream != nil {
++			// The downstream client did not finish authenticating (it
++			// went away, or offered a public key and never signed for
++			// it), but a callback had already authenticated to the
++			// upstream: nothing will ever be piped to that connection.
++			p.upstream.transport.Close()
++			p.upstream = nil
++		}
+ 		return nil, err
+ 	}
+ 
