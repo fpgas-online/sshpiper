@@ -86,7 +86,7 @@ for p in $PLUGINS; do
 done
 
 echo "== a login through sshpiperd (fixed plugin) to a throwaway sshd"
-apt-get install -y --no-install-recommends openssh-server openssh-client sshpass > "$d/apt-tools.log" 2>&1 ||
+apt-get install -y --no-install-recommends openssh-server openssh-client sshpass iproute2 > "$d/apt-tools.log" 2>&1 ||
   { cat "$d/apt-tools.log" >&2; fail "couldn't install the OpenSSH tools the test uses"; }
 ssh -V
 
@@ -99,9 +99,21 @@ ssh-keygen -q -t ed25519 -N '' -C backend -f "$d/backend_host_key"
 ssh-keygen -q -t ed25519 -N '' -C proxy -f "$d/proxy_host_key"
 
 mkdir -p /run/sshd
+# OpenSSH 9.8 and later penalise a source address after failed logins
+# (PerSourcePenalties) and then drop its connections. Every login through
+# sshpiperd comes from sshpiperd's address, so the wrong passwords below
+# would shut this test's own later logins out. Off where sshd knows the
+# option (bookworm's 9.2 doesn't). A real backend behind sshpiperd needs the
+# proxy's address in its PerSourcePenaltyExemptList for the same reason.
+penalties=
+if /usr/sbin/sshd -t -f /dev/null -o HostKey="$d/backend_host_key" -o PerSourcePenalties=no 2> "$d/sshd-probe.err"; then
+  penalties="-o PerSourcePenalties=no"
+fi
+# shellcheck disable=SC2086 # $penalties is one option or nothing
 /usr/sbin/sshd -f /dev/null -E "$d/sshd.log" \
   -o ListenAddress=127.0.0.1 -o Port=$BACKEND_PORT -o HostKey="$d/backend_host_key" \
-  -o PidFile="$d/sshd.pid" -o PasswordAuthentication=yes -o UsePAM=no
+  -o PidFile="$d/sshd.pid" -o PasswordAuthentication=yes -o UsePAM=no $penalties
+echo "backend sshd started${penalties:+ with PerSourcePenalties=no}"
 
 sshpiperd --address 127.0.0.1 --port $PROXY_PORT \
   --server-key "$d/proxy_host_key" --server-key-generate-mode disable \
@@ -166,6 +178,107 @@ fi
 cmp -s "$d/known_hosts" "$d/known_hosts.before" ||
   { logs >&2; fail "the client's known_hosts changed: it learnt a key through sshpiperd"; }
 echo "no hostkeys-00@openssh.com reached the client; its known_hosts is unchanged"
+
+echo "== failed logins leave no connection open at the backend sshd"
+# The defect packaging/patches/sshpiper.crypto/ fixes: sshpiperd kept its
+# onward connection open after the backend refused the relayed password, so
+# every wrong password held one of the backend sshd's unauthenticated
+# connection slots (MaxStartups, 10:30:100 by default) until that sshd's
+# LoginGraceTime (120 s), and enough of them shut real logins out.
+#
+# What is counted: established TCP connections at the backend sshd's port
+# (its side of each: source port BACKEND_PORT), as the kernel lists them.
+backend_connections() {
+  ss -Htn state established "( sport = :$BACKEND_PORT )" | wc -l
+}
+# Polled for up to 5 s: sshpiperd closes the connection as it answers the
+# client, which can return a moment before the kernel has it gone.
+no_backend_connections() {
+  for _ in $(seq 1 25); do
+    [ "$(backend_connections)" -eq 0 ] && return 0
+    sleep 0.2
+  done
+  return 1
+}
+# The client's settings, in a file: sshpass runs ssh itself.
+cat > "$d/ssh_config" <<EOF
+Host 127.0.0.1
+  Port $PROXY_PORT
+  UserKnownHostsFile $d/known_hosts
+  GlobalKnownHostsFile /dev/null
+  StrictHostKeyChecking yes
+  PreferredAuthentications password
+  PubkeyAuthentication no
+EOF
+no_backend_connections || { logs >&2; fail "$(backend_connections) connections at the backend before the test started"; }
+
+# More wrong passwords than MaxStartups' 10, each in a connection of its own.
+WRONG=12
+for i in $(seq 1 $WRONG); do
+  if sshpass -p "wrong-$i" ssh -F "$d/ssh_config" -o NumberOfPasswordPrompts=1 backenduser@127.0.0.1 true 2> "$d/wrong.err"; then
+    fail "a wrong password was let in"
+  fi
+  grep -q "Permission denied" "$d/wrong.err" ||
+    { cat "$d/wrong.err" >&2; logs >&2; fail "wrong password $i was not turned down with Permission denied"; }
+done
+if ! no_backend_connections; then
+  left=$(backend_connections)
+  ss -tn state established "( sport = :$BACKEND_PORT )" >&2
+  grep -i "maxstartups" "$d/sshd.log" >&2 || true
+  fail "$left connections are still open at the backend sshd after $WRONG wrong passwords through sshpiperd (every client has gone)"
+fi
+# Each one reached the backend and was refused there: none was dropped for
+# want of a slot.
+refused=$(grep -c "Failed password for backenduser" "$d/sshd.log")
+[ "$refused" -eq $WRONG ] || { logs >&2; fail "the backend sshd refused $refused passwords, not $WRONG"; }
+echo "$WRONG wrong passwords, each refused by the backend: 0 connections left open at the backend sshd"
+
+# One connection, one wrong password, then the right one: the client's
+# normal retries must still work. ssh asks this program for each password.
+cat > "$d/askpass" <<EOF
+#!/bin/sh
+n=\$(cat "$d/askpass.count")
+n=\$((n + 1))
+echo "\$n" > "$d/askpass.count"
+if [ "\$n" -ge "\$(cat "$d/askpass.right-at")" ]; then echo "$password"; else echo "wrong-in-connection-\$n"; fi
+EOF
+chmod +x "$d/askpass"
+echo 0 > "$d/askpass.count"
+echo 2 > "$d/askpass.right-at"
+landed=$(SSH_ASKPASS="$d/askpass" SSH_ASKPASS_REQUIRE=force ssh -F "$d/ssh_config" -o NumberOfPasswordPrompts=3 \
+  backenduser@127.0.0.1 'echo "user=$(id -un) connection=$SSH_CONNECTION"' < /dev/null 2> "$d/retry.err") ||
+  { cat "$d/retry.err" >&2; logs >&2; fail "a wrong password and then the right one, in one connection, did not log in"; }
+[ "$(cat "$d/askpass.count")" -eq 2 ] || fail "ssh asked for $(cat "$d/askpass.count") passwords, not 2"
+case "$landed" in
+  "user=backenduser connection=127.0.0.1 "*" 127.0.0.1 $BACKEND_PORT") ;;
+  *) logs >&2; fail "after a wrong password, the right one did not land on the backend sshd: $landed" ;;
+esac
+echo "one connection, a wrong password then the right one: landed on: $landed"
+
+# One connection, three wrong passwords: the client gets all three attempts.
+echo 0 > "$d/askpass.count"
+echo 99 > "$d/askpass.right-at"
+if SSH_ASKPASS="$d/askpass" SSH_ASKPASS_REQUIRE=force ssh -F "$d/ssh_config" -o NumberOfPasswordPrompts=3 \
+  backenduser@127.0.0.1 true < /dev/null 2> "$d/three.err"; then
+  fail "three wrong passwords were let in"
+fi
+[ "$(cat "$d/askpass.count")" -eq 3 ] ||
+  { cat "$d/three.err" >&2; logs >&2; fail "the client got $(cat "$d/askpass.count") password attempts in one connection, not 3"; }
+refused=$(grep -c "Failed password for backenduser" "$d/sshd.log")
+[ "$refused" -eq $((WRONG + 1 + 3)) ] ||
+  { logs >&2; fail "the backend sshd has refused $refused passwords in all, not $((WRONG + 1 + 3))"; }
+no_backend_connections ||
+  { ss -tn state established "( sport = :$BACKEND_PORT )" >&2; fail "$(backend_connections) connections left open at the backend sshd after the retries"; }
+echo "one connection, three wrong passwords: three attempts, all refused; 0 connections left open at the backend sshd"
+
+# And a correct login still works after all of that.
+landed=$(sshpass -p "$password" ssh -F "$d/ssh_config" backenduser@127.0.0.1 'echo "user=$(id -un) connection=$SSH_CONNECTION"') ||
+  { logs >&2; fail "a correct login through sshpiperd failed after the wrong ones"; }
+case "$landed" in
+  "user=backenduser connection=127.0.0.1 "*" 127.0.0.1 $BACKEND_PORT") ;;
+  *) logs >&2; fail "the login after the wrong ones did not land on the backend sshd: $landed" ;;
+esac
+echo "a correct login afterwards landed on: $landed"
 
 kill "$piper"
 kill "$(cat "$d/sshd.pid")"
